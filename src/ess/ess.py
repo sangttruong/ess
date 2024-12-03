@@ -2,92 +2,32 @@ import numpy as np
 import torch
 
 
-class GibbsESSampler:
+class ESSampler:
     def __init__(
         self,
-        likelihood,
-        theta_prior_dists,
-        z_prior_dists,
-        y_train,
-        train_test_split_idx,
-        list_saidx,
-        all_squidx,
-        student_idxs,
-        list_saidx2aidx,
-        unique_time_obs,
+        model: Model,
+        data,
         device,
-        n_points=100,
     ):
         self.device = device
-        self.theta_prior_dists = theta_prior_dists
-        self.z_prior_dists = z_prior_dists
-        self.n_students = len(theta_prior_dists)
-        self.n_testcases = z_prior_dists.loc.shape[0]
-        self.y_train = y_train
-        self.train_test_split_idx = train_test_split_idx
-        self.list_saidx = list_saidx
-        self.all_squidx = all_squidx
-        self.student_idxs = student_idxs
-        self.list_saidx2aidx = list_saidx2aidx
-        self.unique_time_obs = unique_time_obs
-        self.n_points = n_points
-
-        self.student_masks = []
-        for sidx in range(self.n_students):
-            if list_saidx[sidx] is None:
-                self.student_masks.append(None)
-            else:
-                self.student_masks.append(self.student_idxs == sidx)
-
-        # Initialize likelihood
-        self.likelihood = likelihood(device=device)
-        self.list_points = []
-        self.list_thetas = []
-        self.list_zs = []
-
-    def load_state(self, result_folder, continue_iter=0):
-        if continue_iter == 0:
-            print("Initializing thetas and zs")
-            self.iter = 0
-            self.previous_thetas, self.previous_points = self.sample_theta_prior(
-                sample_size=64
-            )
-            self.previous_zs = self.sample_z_prior()
-
-        else:
-            print("Loading thetas and zs")
-            self.iter = continue_iter
-            list_points = torch.load(
-                f"{result_folder}/ess_points_by_iter_{continue_iter}.pt"
-            )
-            list_thetas = torch.load(
-                f"{result_folder}/ess_thetas_by_iter_{continue_iter}.pt"
-            )
-            list_zs = torch.load(f"{result_folder}/ess_zs_by_iter_{continue_iter}.pt")
-
-            self.previous_points = list_points[-1].to(self.device).float()
-            self.previous_thetas = list_thetas[-1].to(self.device).float()
-            self.previous_zs = list_zs[-1].to(self.device)[self.all_squidx].float()
+        self.model = model
+        self.data = data
 
     def sample(
         self,
-        sampling_theta=False,
-        sampling_z=False,
+        sampling_index: int,
     ):
-        if sampling_theta == sampling_z == False:
-            raise ValueError(
-                "At least one of sampling_theta and sampling_z must be True"
-            )
+        """
+        Write docstring
 
-        if sampling_theta:
-            previous_f = self.previous_thetas
-            other_f = self.previous_zs
-            nu, nu_points = self.sample_theta_prior()
+        Args:
+            sampling_index (int): index where the sample gets updated
+        """
+        assert sampling_index < self.model.n_latent
 
-        elif sampling_z:
-            previous_f = self.previous_zs
-            other_f = self.previous_thetas
-            nu = self.sample_z_prior()
+        # WIP: Need to have previous state to move as Markov Chain
+        nu = self.model.sample_prior(sampling_index)
+        
 
         ll_current = self.likelihood.log_likelihood(
             previous_f[: self.train_test_split_idx],
@@ -143,7 +83,72 @@ class GibbsESSampler:
             self.previous_zs = next_f
 
         return log_likelihood
+    
+    def save_state(self, result_folder, iteration):
+        # Save thetas and zs with torch.save
+        torch.save(
+            self.list_points,
+            f"{result_folder}/ess_points_by_iter_{iteration}.pt",
+        )
+        torch.save(
+            self.list_thetas,
+            f"{result_folder}/ess_thetas_by_iter_{iteration}.pt",
+        )
+        torch.save(
+            self.list_zs,
+            f"{result_folder}/ess_zs_by_iter_{iteration}.pt",
+        )
+        print(f"Saved thetas and zs at iteration {iteration}")
+        # Clear thetas and zs
 
+        self.list_points = []
+        self.list_thetas = []
+        self.list_zs = []
+
+    def load_state(self, result_folder, continue_iter=0):
+        if continue_iter == 0:
+            print("Initializing thetas and zs")
+            self.iter = 0
+            self.previous_thetas, self.previous_points = self.sample_theta_prior(
+                sample_size=64
+            )
+            self.previous_zs = self.sample_z_prior()
+
+        else:
+            print("Loading thetas and zs")
+            self.iter = continue_iter
+            list_points = torch.load(
+                f"{result_folder}/ess_points_by_iter_{continue_iter}.pt"
+            )
+            list_thetas = torch.load(
+                f"{result_folder}/ess_thetas_by_iter_{continue_iter}.pt"
+            )
+            list_zs = torch.load(f"{result_folder}/ess_zs_by_iter_{continue_iter}.pt")
+
+            self.previous_points = list_points[-1].to(self.device).float()
+            self.previous_thetas = list_thetas[-1].to(self.device).float()
+            self.previous_zs = list_zs[-1].to(self.device)[self.all_squidx].float()
+
+
+
+from abc import ABC, abstractmethod
+
+
+class Model(ABC):
+    def __init__(self):
+        pass
+
+    @abstractmethod
+    def sampling_prior(self):
+        pass
+
+    @abstractmethod
+    def eval_log_likelihood(self):
+        pass
+    
+
+
+class IRTModel(Model):
     def sample_z_prior(self):
         return self.z_prior_dists.sample()[self.all_squidx]
 
@@ -167,23 +172,25 @@ class GibbsESSampler:
 
         return torch.cat(thetas), torch.cat(points)
 
-    def save_state(self, result_folder, iteration):
-        # Save thetas and zs with torch.save
-        torch.save(
-            self.list_points,
-            f"{result_folder}/ess_points_by_iter_{iteration}.pt",
-        )
-        torch.save(
-            self.list_thetas,
-            f"{result_folder}/ess_thetas_by_iter_{iteration}.pt",
-        )
-        torch.save(
-            self.list_zs,
-            f"{result_folder}/ess_zs_by_iter_{iteration}.pt",
-        )
-        print(f"Saved thetas and zs at iteration {iteration}")
+if __name__ == "__main__":
+    #Placeholder values for n_students, list_saidx, student_idxs
+    n_students = 100 #This is a placeholder
+    list_saidx = [None] * n_students #This is a placeholder
+    student_idxs = torch.rand(100) #This is a placeholder
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Clear thetas and zs
-        self.list_points = []
-        self.list_thetas = []
-        self.list_zs = []
+    student_masks = []
+    for sidx in range(n_students):
+        if list_saidx[sidx] is None:
+            student_masks.append(None)
+        else:
+            student_masks.append(student_idxs == sidx)
+
+    # Initialize likelihood
+    # likelihood = likelihood(device=device)
+    list_points = []
+    list_thetas = []
+    list_zs = []
+
+git fetch origin
+git checkout 1-separate-model-from-sample
