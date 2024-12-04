@@ -1,2 +1,2 @@
 
-from ess import GibbsESSampler
+from .ess import GibbsESSampler
