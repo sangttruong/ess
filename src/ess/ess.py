@@ -33,8 +33,8 @@ class GibbsESSampler:
         pbar = tqdm(range(n))
         for _ in pbar:
             self.step()
-            list_ability.append(self.abilities)
-            list_difficulty.append(self.difficulties)
+            list_ability.append(self.abilities.cpu())
+            list_difficulty.append(self.difficulties.cpu())
             pbar.set_postfix({"llh": self.log_likelihood.item()})
         return torch.stack(list_ability), torch.stack(list_difficulty)
 
