@@ -1,117 +1,156 @@
-import numpy as np
+from __future__ import annotations
+
+from typing import Tuple
+
 import torch
+import numpy as np
+from tqdm import tqdm
+from torch import Tensor
 
 
 class GibbsESSampler:
     def __init__(
         self,
-        likelihood,
-        theta_prior_dists,
-        z_prior_dists,
-        y_train,
-        train_test_split_idx,
-        list_saidx,
-        all_squidx,
-        student_idxs,
-        list_saidx2aidx,
-        unique_time_obs,
-        device,
-        n_points=100,
+        model,
+        device="cpu"
     ):
+        self.model = model
+        self.abilities = None
+        self.difficulties = None
         self.device = device
-        self.theta_prior_dists = theta_prior_dists
-        self.z_prior_dists = z_prior_dists
-        self.n_students = len(theta_prior_dists)
-        self.n_testcases = z_prior_dists.loc.shape[0]
-        self.y_train = y_train
-        self.train_test_split_idx = train_test_split_idx
-        self.list_saidx = list_saidx
-        self.all_squidx = all_squidx
-        self.student_idxs = student_idxs
-        self.list_saidx2aidx = list_saidx2aidx
-        self.unique_time_obs = unique_time_obs
-        self.n_points = n_points
 
-        self.student_masks = []
-        for sidx in range(self.n_students):
-            if list_saidx[sidx] is None:
-                self.student_masks.append(None)
-            else:
-                self.student_masks.append(self.student_idxs == sidx)
+    def draw(self, n: int = 1) -> Tuple[Tensor, Tensor]:
+        r"""Draw samples.
 
-        # Initialize likelihood
-        self.likelihood = likelihood(device=device)
-        self.list_points = []
-        self.list_thetas = []
-        self.list_zs = []
+        Args:
+            n: The number of samples.
 
-    def load_state(self, result_folder, continue_iter=0):
-        if continue_iter == 0:
-            print("Initializing thetas and zs")
-            self.iter = 0
-            self.previous_thetas, self.previous_points = self.sample_theta_prior(
-                sample_size=64
-            )
-            self.previous_zs = self.sample_z_prior()
+        Returns:
+            A `n x d`-dim tensor of `n` samples.
+        """
+        list_ability = []
+        list_difficulty = []
+        pbar = tqdm(range(n))
+        for _ in pbar:
+            self.step()
+            list_ability.append(self.abilities.cpu())
+            list_difficulty.append(self.difficulties.cpu())
+            pbar.set_postfix({"llh": self.log_likelihood.item()})
+        return torch.stack(list_ability), torch.stack(list_difficulty)
 
-        else:
-            print("Loading thetas and zs")
-            self.iter = continue_iter
-            list_points = torch.load(
-                f"{result_folder}/ess_points_by_iter_{continue_iter}.pt"
-            )
-            list_thetas = torch.load(
-                f"{result_folder}/ess_thetas_by_iter_{continue_iter}.pt"
-            )
-            list_zs = torch.load(f"{result_folder}/ess_zs_by_iter_{continue_iter}.pt")
+    def step(self) -> Tensor:
+        r"""Take a step, return the new sample, update the internal state.
 
-            self.previous_points = list_points[-1].to(self.device).float()
-            self.previous_thetas = list_thetas[-1].to(self.device).float()
-            self.previous_zs = list_zs[-1].to(self.device)[self.all_squidx].float()
+        Returns:
+            A `d x 1`-dim sample from the domain.
+        """
+        if self.abilities is None:
+            self.abilities, self.support_points = self.model.sample_theta_prior()
+        if self.difficulties is None:
+            self.difficulties = self.model.sample_item_prior()
 
-    def sample(
+        self.abilities = self.step_ability()
+        self.difficulties = self.step_difficulty()
+        return self.abilities, self.difficulties
+
+    def step_ability(self) -> Tensor:
+        r"""Take a step in the ability direction.
+
+        Returns:
+            A `d x 1`-dim sample from the domain.
+        """
+        nu, points = self.model.sample_theta_prior()
+        theta = self._draw_angle(
+            self.abilities, self.difficulties, nu=nu, is_ability=True)
+        output = self._get_cart_coords(self.abilities, nu=nu, theta=theta)
+        return output
+
+    def step_difficulty(self) -> Tensor:
+        r"""Take a step in the difficulty direction.
+
+        Returns:
+            A `d x 1`-dim sample from the domain.
+        """
+        nu = self.model.sample_item_prior()
+        theta = self._draw_angle(
+            self.difficulties, self.abilities, nu=nu, is_ability=False)
+        output = self._get_cart_coords(self.difficulties, nu=nu, theta=theta)
+        return output
+
+    def _get_cart_coords(self, input_vec: Tensor, nu: Tensor, theta: Tensor) -> Tensor:
+        r"""Determine location on ellipsoid in cartesian coordinates.
+
+        Args:
+            nu: A `d x 1`-dim tensor (the "new" direction, drawn from N(0, I)).
+            theta: A `k`-dim tensor of angles.
+
+        Returns:
+            A `d x k`-dim tensor of samples from the domain in cartesian coordinates.
+        """
+        return input_vec * torch.cos(theta) + nu * torch.sin(theta)
+
+    def _draw_angle(
         self,
-        sampling_theta=False,
-        sampling_z=False,
+        previous_f: Tensor,
+        other_f: Tensor,
+        nu: Tensor,
+        is_ability: bool,
     ):
-        if sampling_theta == sampling_z == False:
-            raise ValueError(
-                "At least one of sampling_theta and sampling_z must be True"
+        """Draw an angle for the next sample.
+
+        Args:
+            previous_f (Tensor): The previous sample.
+            other_f (Tensor): The other factor (if previous_f is ability, then other_f is difficulty).
+            nu (Tensor): The new direction.
+            is_ability (bool): Whether the previous sample is an ability or difficulty.
+
+        Returns:
+            Tensor: The angle.
+        """
+        if is_ability:
+            ll_current = self.model.log_likelihood(
+                ability=previous_f,
+                difficulty=other_f,
+                disciminatory=1,
+                guessing=0,
+                loading_factor=1
             )
-
-        if sampling_theta:
-            previous_f = self.previous_thetas
-            other_f = self.previous_zs
-            nu, nu_points = self.sample_theta_prior()
-
-        elif sampling_z:
-            previous_f = self.previous_zs
-            other_f = self.previous_thetas
-            nu = self.sample_z_prior()
-
-        ll_current = self.likelihood.log_likelihood(
-            previous_f[: self.train_test_split_idx],
-            other_f[: self.train_test_split_idx],
-            self.y_train,
-        )
+        else:
+            ll_current = self.model.log_likelihood(
+                ability=other_f,
+                difficulty=previous_f,
+                disciminatory=1,
+                guessing=0,
+                loading_factor=1
+            )
         ll_thres = ll_current + torch.log(torch.rand(1, device=self.device))
 
         angle = torch.rand(1, device=self.device) * 2 * np.pi
         angle_min, angle_max = angle - 2 * np.pi, angle
 
         while True:
-            next_f = torch.cos(angle) * previous_f + torch.sin(angle) * nu
-            log_likelihood = self.likelihood.log_likelihood(
-                next_f[: self.train_test_split_idx],
-                other_f[: self.train_test_split_idx],
-                self.y_train,
-            )
+            next_f = self._get_cart_coords(previous_f, nu, angle)
+            if is_ability:
+                self.log_likelihood = self.model.log_likelihood(
+                    ability=next_f,
+                    difficulty=other_f,
+                    disciminatory=1,
+                    guessing=0,
+                    loading_factor=1
+                )
+            else:
+                self.log_likelihood = self.model.log_likelihood(
+                    ability=other_f,
+                    difficulty=next_f,
+                    disciminatory=1,
+                    guessing=0,
+                    loading_factor=1
+                )
 
-            if log_likelihood > ll_thres:
+            if self.log_likelihood >= ll_thres:
                 break
             else:
                 if angle == 0:
-                    next_f = previous_f
                     break
 
                 if angle < 0:
@@ -123,67 +162,4 @@ class GibbsESSampler:
                     + angle_min
                 )
 
-        # Save thetas and zs
-        if sampling_theta:
-            self.list_thetas.append(next_f.to(torch.bfloat16).cpu())
-            self.previous_thetas = next_f
-
-            self.previous_points = (
-                torch.cos(angle) * self.previous_points + torch.sin(angle) * nu_points
-            )
-            self.list_points.append(self.previous_points.to(torch.bfloat16).cpu())
-            self.iter += 1
-            if self.iter % 100 == 0:
-                print(f"Iteration {self.iter}\tLog likelihood: {log_likelihood}")
-
-        elif sampling_z:
-            constructed_z = torch.zeros((self.n_testcases,), device=self.device)
-            constructed_z[self.all_squidx] = next_f
-            self.list_zs.append(constructed_z.to(torch.bfloat16).cpu())
-            self.previous_zs = next_f
-
-        return log_likelihood
-
-    def sample_z_prior(self):
-        return self.z_prior_dists.sample()[self.all_squidx]
-
-    def sample_theta_prior_by_student(self, sidx, sample_size=1):
-        if self.theta_prior_dists[sidx] is None:
-            return []
-        else:
-            return self.theta_prior_dists[sidx].sample(torch.Size([sample_size]))
-
-    def sample_theta_prior(self, sample_size=1):
-        thetas = []
-        points = []
-        for sidx in range(self.n_students):
-            if self.list_saidx[sidx] is None:
-                continue
-
-            prior_samples = self.sample_theta_prior_by_student(sidx).mean(dim=0)
-
-            thetas.append(prior_samples[: -self.n_points][self.list_saidx[sidx]])
-            points.append(prior_samples[-self.n_points :])
-
-        return torch.cat(thetas), torch.cat(points)
-
-    def save_state(self, result_folder, iteration):
-        # Save thetas and zs with torch.save
-        torch.save(
-            self.list_points,
-            f"{result_folder}/ess_points_by_iter_{iteration}.pt",
-        )
-        torch.save(
-            self.list_thetas,
-            f"{result_folder}/ess_thetas_by_iter_{iteration}.pt",
-        )
-        torch.save(
-            self.list_zs,
-            f"{result_folder}/ess_zs_by_iter_{iteration}.pt",
-        )
-        print(f"Saved thetas and zs at iteration {iteration}")
-
-        # Clear thetas and zs
-        self.list_points = []
-        self.list_thetas = []
-        self.list_zs = []
+        return angle
