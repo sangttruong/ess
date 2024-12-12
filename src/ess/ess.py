@@ -17,6 +17,7 @@ class GibbsESSampler:
         self.model = model
         self.abilities = None
         self.difficulties = None
+        self.log_likelihood = None
         self.device = device
 
     def draw(self, n: int = 1) -> Tuple[Tensor, Tensor]:
@@ -28,6 +29,19 @@ class GibbsESSampler:
         Returns:
             A `n x d`-dim tensor of `n` samples.
         """
+        if self.abilities is None:
+            self.abilities, self.support_points = self.model.sample_theta_prior()
+        if self.difficulties is None:
+            self.difficulties = self.model.sample_item_prior()
+        if self.log_likelihood is None:
+            self.log_likelihood = self.model.log_likelihood(
+                ability=self.abilities,
+                difficulty=self.difficulties,
+                disciminatory=1,
+                guessing=0,
+                loading_factor=1
+            )
+        
         list_ability = []
         list_difficulty = []
         pbar = tqdm(range(n))
@@ -44,11 +58,6 @@ class GibbsESSampler:
         Returns:
             A `d x 1`-dim sample from the domain.
         """
-        if self.abilities is None:
-            self.abilities, self.support_points = self.model.sample_theta_prior()
-        if self.difficulties is None:
-            self.difficulties = self.model.sample_item_prior()
-
         self.abilities = self.step_ability()
         self.difficulties = self.step_difficulty()
         return self.abilities, self.difficulties
@@ -107,23 +116,7 @@ class GibbsESSampler:
         Returns:
             Tensor: The angle.
         """
-        if is_ability:
-            ll_current = self.model.log_likelihood(
-                ability=previous_f,
-                difficulty=other_f,
-                disciminatory=1,
-                guessing=0,
-                loading_factor=1
-            )
-        else:
-            ll_current = self.model.log_likelihood(
-                ability=other_f,
-                difficulty=previous_f,
-                disciminatory=1,
-                guessing=0,
-                loading_factor=1
-            )
-        ll_thres = ll_current + torch.log(torch.rand(1, device=self.device))
+        ll_thres = self.log_likelihood + torch.log(torch.rand(1, device=self.device))
 
         angle = torch.rand(1, device=self.device) * 2 * np.pi
         angle_min, angle_max = angle - 2 * np.pi, angle
@@ -150,9 +143,6 @@ class GibbsESSampler:
             if self.log_likelihood >= ll_thres:
                 break
             else:
-                if angle == 0:
-                    break
-
                 if angle < 0:
                     angle_min = angle
                 else:
